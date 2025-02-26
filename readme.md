@@ -3,6 +3,13 @@
 Code trên là một ứng dụng Gradio chạy mô hình LLaMA-Mesh để tạo và hiển thị lưới 3D (3D meshes) từ đầu vào văn bản. Dưới đây là phân tích về từng phần chính:
 
 ---
+python -m venv .venv
+
+.\.venv\Scripts\Activate
+.venv\Scripts\activate
+source .venv/Scripts/activate
+
+python -m pip install -r requirements.txt
 
 ## **1. Cấu Trúc Chính**
 - **Nạp thư viện cần thiết:** 

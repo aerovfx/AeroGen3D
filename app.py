@@ -1,84 +1,96 @@
 import os
-import gradio as gr
-import numpy as np
-import trimesh
-import tempfile
-import threading
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# Tắt cảnh báo parallelism để tránh lỗi khi chạy tokenizer
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-HF_TOKEN = os.getenv("HF_TOKEN", None)
 
-# Load model and tokenizer
-model_path = "Zhengyi/LLaMA-Mesh"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", torch_dtype="auto")
+import gradio as gr
+import trimesh
+import numpy as np
+import tempfile
+from threading import Thread
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from trimesh.exchange.gltf import export_glb
 
-def chat_llama3_8b(message: str, history: list, temperature: float, max_new_tokens: int) -> str:
-    """ Sinh phản hồi từ mô hình ngôn ngữ LLaMA. """
-    inputs = tokenizer.encode(message, return_tensors="pt").to(model.device)
-    output = model.generate(
-        inputs, max_new_tokens=max_new_tokens, temperature=temperature, pad_token_id=tokenizer.eos_token_id
-    )
-    return tokenizer.decode(output[0], skip_special_tokens=True)
+# Load the model and tokenizer only once
+MODEL_PATH = "Zhengyi/LLaMA-Mesh"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, device_map="auto")
+
+TERMINATORS = [
+    tokenizer.eos_token_id,
+    tokenizer.convert_tokens_to_ids("<|eot_id|>")
+]
 
 def apply_gradient_color(mesh_text: str) -> str:
-    """ Thêm màu gradient vào lưới 3D theo trục Y. """
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as temp_obj:
-            temp_obj.write(mesh_text.encode("utf-8"))
-            temp_obj.close()
-            mesh = trimesh.load_mesh(temp_obj.name)
-        
-        # Kiểm tra mesh hợp lệ
-        if mesh.vertices.shape[0] == 0:
-            return "Mesh không hợp lệ. Kiểm tra lại dữ liệu đầu vào."
-        
-        y_min, y_max = mesh.vertices[:, 1].min(), mesh.vertices[:, 1].max()
-        y_normalized = (mesh.vertices[:, 1] - y_min) / (y_max - y_min + 1e-6)
-        colors = np.zeros((mesh.vertices.shape[0], 4))
-        colors[:, 0] = np.clip(y_normalized, 0, 1)  # Kênh đỏ
-        colors[:, 2] = np.clip(1 - y_normalized, 0, 1)  # Kênh xanh
-        colors[:, 3] = 1  # Alpha = 1
-        mesh.visual.vertex_colors = (colors * 255).astype(np.uint8)
-        
-        # Lưu mesh đã xử lý thành file GLB
-        with tempfile.NamedTemporaryFile(suffix=".glb", delete=False) as temp_glb:
-            mesh.export(temp_glb.name)
-            return temp_glb.name
-    except Exception as e:
-        return f"Lỗi khi xử lý mesh: {str(e)}"
-
-def visualize_mesh(mesh_text: str):
-    """ Hiển thị lưới 3D từ văn bản OBJ. """
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as temp_obj:
-            temp_obj.write(mesh_text.encode("utf-8"))
-            temp_obj.close()
-            return temp_obj.name
-    except Exception as e:
-        return f"Lỗi khi hiển thị mesh: {str(e)}"
-
-# Gradio UI
-def gradio_interface():
-    with gr.Blocks(css=".container { width: 100%; height: 100vh; }") as demo:
-        gr.Markdown("## 🎨 LLaMA 3D Mesh Generator 🎨")
-        chatbot = gr.Chatbot(height=450, placeholder="Nhập mô tả của bạn...")
-        
-        with gr.Row():
-            input_box = gr.Textbox(placeholder="Nhập dữ liệu OBJ hoặc văn bản mô tả 3D", lines=6)
-            btn_generate = gr.Button("Tạo 3D Mesh")
-        
-        with gr.Row():
-            temperature_slider = gr.Slider(0, 1, 0.7, label="Temperature")
-            token_slider = gr.Slider(128, 4096, 2048, label="Max Tokens")
-        
-        output_mesh = gr.Model3D()
-        
-        btn_generate.click(fn=apply_gradient_color, inputs=[input_box], outputs=[output_mesh])
+    """
+    Apply a gradient color to the mesh vertices based on the Y-axis and save as GLB.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as temp_file:
+        temp_file.write(mesh_text.encode())
+        temp_file_path = temp_file.name
     
-    return demo
+    mesh = trimesh.load_mesh(temp_file_path, file_type='obj')
+    y_values = mesh.vertices[:, 1]
+    y_normalized = (y_values - y_values.min()) / (y_values.max() - y_values.min())
 
-demo = gradio_interface()
+    colors = np.zeros((len(mesh.vertices), 4))
+    colors[:, 0] = y_normalized
+    colors[:, 2] = 1 - y_normalized
+    colors[:, 3] = 1.0
+    mesh.visual.vertex_colors = colors
+
+    glb_path = temp_file_path.replace(".obj", ".glb")
+    with open(glb_path, "wb") as f:
+        f.write(export_glb(mesh))
+    
+    return glb_path
+
+def chat_llama3_8b(message: str, history: list, temperature: float, max_new_tokens: int):
+    """ Generate a streaming response using the llama3-8b model."""
+    conversation = [
+        {"role": "user", "content": user} if i % 2 == 0 else {"role": "assistant", "content": assistant}
+        for i, (user, assistant) in enumerate(history)
+    ]
+    conversation.append({"role": "user", "content": message})
+
+    input_ids = tokenizer.apply_chat_template(conversation, return_tensors="pt").to(model.device)
+    streamer = TextIteratorStreamer(tokenizer, timeout=10.0, skip_prompt=True, skip_special_tokens=True)
+
+    generate_kwargs = {
+        "input_ids": input_ids,
+        "streamer": streamer,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": temperature > 0,
+        "temperature": temperature,
+        "eos_token_id": TERMINATORS,
+    }
+    
+    Thread(target=model.generate, kwargs=generate_kwargs).start()
+    outputs = []
+    for text in streamer:
+        outputs.append(text)
+        yield "".join(outputs)
+
+with gr.Blocks(fill_height=True) as demo:
+    gr.Markdown("# LLaMA-Mesh: Generate and Visualize 3D Meshes")
+    with gr.Row():
+        chatbot = gr.Chatbot(height=450, label='Chat with LLaMA-Mesh')
+        output_model = gr.Model3D(label="3D Mesh Visualization", interactive=False)
+    
+    mesh_input = gr.Textbox(label="3D Mesh Input", placeholder="Paste OBJ format here...", lines=5)
+    visualize_button = gr.Button("Visualize 3D Mesh")
+    
+    visualize_button.click(fn=apply_gradient_color, inputs=[mesh_input], outputs=[output_model])
+    
+    gr.ChatInterface(
+        fn=chat_llama3_8b,
+        chatbot=chatbot,
+        additional_inputs=[
+            gr.Slider(minimum=0, maximum=1, step=0.1, value=0.95, label="Temperature"),
+            gr.Slider(minimum=128, maximum=8192, step=1, value=4096, label="Max new tokens"),
+        ],
+        examples=[
+            ["Create a 3D model of a table"],
+            ["Create a low-poly 3D model of a tree"],
+        ],
+    )
+
 demo.launch()
